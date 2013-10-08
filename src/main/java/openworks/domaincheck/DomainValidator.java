@@ -4,24 +4,16 @@ import java.io.FileNotFoundException;
 import java.io.FileReader;
 import java.io.FileWriter;
 import java.io.IOException;
-import java.io.InputStream;
-import java.net.UnknownHostException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
-import java.util.Scanner;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
-import org.apache.http.HttpResponse;
-import org.apache.http.client.config.RequestConfig;
-import org.apache.http.client.methods.HttpGet;
-import org.apache.http.concurrent.FutureCallback;
-import org.apache.http.impl.nio.client.CloseableHttpAsyncClient;
-import org.apache.http.impl.nio.client.HttpAsyncClients;
 import org.apache.log4j.Logger;
 import org.kohsuke.args4j.CmdLineException;
 import org.kohsuke.args4j.CmdLineParser;
@@ -29,6 +21,15 @@ import org.kohsuke.args4j.Option;
 
 import au.com.bytecode.opencsv.CSVReader;
 import au.com.bytecode.opencsv.CSVWriter;
+
+import com.ning.http.client.AsyncHandler;
+import com.ning.http.client.AsyncHttpClient;
+import com.ning.http.client.AsyncHttpClientConfig;
+import com.ning.http.client.AsyncHttpClientConfig.Builder;
+import com.ning.http.client.HttpResponseBodyPart;
+import com.ning.http.client.HttpResponseHeaders;
+import com.ning.http.client.HttpResponseStatus;
+import com.ning.http.client.Response;
 
 public class DomainValidator {
 
@@ -44,25 +45,33 @@ public class DomainValidator {
 	@Option(name = "-v", aliases = "--validRowElemCount", usage = "Optional. Row in the CSV will be ignored if it didn't match this count!")
 	private int lengthOfValidRow = -1;
 
-	@Option(name = "-b", aliases = "--batchSize", usage = "Optional. Number of threads per batch. Default:100")
+	@Option(name = "-b", aliases = "--batchSize", usage = "Optional. Number of threads per batch. Recommended to set batch timeout as well. Default:100")
 	private int batchSize = 100;
 
 	@Option(name = "-f", aliases = "--includeFailedDomains", usage = "Optional. Should the domains failed from processing to be included as well. Default:true")
+	private String includeFailedDomainsString = "true";
+
 	private boolean includeFailedDomains = true;
 
-	@Option(name = "-t", aliases = "--batchTimeout", usage = "Optional. Batch timeout in secs. Default:60s")
-	private long batchTimeoutInSecs = 60;
+	@Option(name = "-t", aliases = "--batchTimeout", usage = "Optional. Batch timeout in secs. Default:120s")
+	private long batchTimeoutInSecs = 120;
+
+	@Option(name = "-r", aliases = "--retryFailed", usage = "Optional. Retry the failed URLs finally with 1/10th of batch size. Default:false")
+	private String retryFailedURLsString = "false";
+
+	private boolean retryFailedURLs = false;
 
 	private CSVReader csvReader;
 
 	private CSVWriter csvWriter;
 
-	private List<String[]> unknownHostsURLList = new ArrayList<String[]>();
+	private List<String[]> failedURLList = new ArrayList<String[]>();
 
-	final RequestConfig requestConfig = RequestConfig.custom()
-			.setSocketTimeout(50000).setConnectTimeout(20000).build();
-	final CloseableHttpAsyncClient httpclient = HttpAsyncClients.custom()
-			.setDefaultRequestConfig(requestConfig).build();
+	private AsyncHttpClient client;
+
+	private AtomicLong failedURLs = new AtomicLong(0);
+
+	private AtomicLong invalidDomainURLs = new AtomicLong(0);
 
 	private static final Logger logger = Logger
 			.getLogger(DomainValidator.class);
@@ -89,6 +98,15 @@ public class DomainValidator {
 			csvReader = new CSVReader(reader);
 			FileWriter writer = new FileWriter(this.destFileName);
 			csvWriter = new CSVWriter(writer);
+			this.includeFailedDomains = Boolean
+					.parseBoolean(includeFailedDomainsString);
+			this.retryFailedURLs = Boolean.parseBoolean(retryFailedURLsString);
+			Builder builder = new AsyncHttpClientConfig.Builder();
+			builder.setCompressionEnabled(true).setFollowRedirects(true)
+					.setConnectionTimeoutInMs(40000).setIOThreadMultiplier(8)
+					.setAllowPoolingConnection(true)
+					.setRequestTimeoutInMs(60000).build();
+			this.client = new AsyncHttpClient(builder.build());
 			return true;
 		} catch (CmdLineException e) {
 			System.err.println(e.getMessage());
@@ -109,20 +127,32 @@ public class DomainValidator {
 	private void process() throws Exception {
 		long startTime = System.currentTimeMillis();
 		List<String[]> csvData = csvReader.readAll();
-		httpclient.start();
 		logger.info("Domain validator started!");
 		BatchIterator<String[]> iterator = new BatchIterator<String[]>(csvData,
 				batchSize);
-		batch(iterator, false);
+		if (retryFailedURLs) {
+			batch(iterator, false);
 
-		logger.info("Begin processing the urls ended up in UHE, second time!");
-		BatchIterator<String[]> unknownHostIterator = new BatchIterator<String[]>(
-				unknownHostsURLList, 5);
-		batch(unknownHostIterator, true);
+			logger.info("Begin processing the urls ended up in UHE, second time!");
+			int failedBatchSize = batchSize / 10;
+			if (failedBatchSize < 5) {
+				failedBatchSize = 5;
+			} else if (failedBatchSize < 10) {
+				failedBatchSize = 10;
+			}
+			BatchIterator<String[]> unknownHostIterator = new BatchIterator<String[]>(
+					failedURLList, failedBatchSize);
+			batch(unknownHostIterator, true);
+		} else {
+			batch(iterator, true);
+		}
+
 		logger.info("Time to process" + ":"
 				+ (System.currentTimeMillis() - startTime) + "ms");
+		logger.info("Total URLs:" + csvData.size() + "\nFailed URLs:"
+				+ failedURLs.longValue() + "\nInvalid Domain URLs:"
+				+ invalidDomainURLs.longValue());
 		Thread.sleep(10000);
-		httpclient.close();
 		csvReader.close();
 		csvWriter.flush();
 		csvWriter.close();
@@ -133,13 +163,13 @@ public class DomainValidator {
 	 * @throws IOException
 	 */
 	private void batch(BatchIterator<String[]> iterator,
-			boolean isUnknownHostBatch) throws IOException {
+			boolean isFailedURLBatch) throws IOException {
 		int batchNum = 1;
 		while (iterator.hasNext()) {
 			long batchStartTime = System.currentTimeMillis();
 			Collection<String[]> currentBatch = iterator.next();
 			Map<String, String[]> urlMap = getURLMapFromCSV(currentBatch);
-			performRequest(urlMap, !isUnknownHostBatch);
+			performRequest(urlMap, !isFailedURLBatch);
 			csvWriter.flush();
 			logger.info("Time to process the batch-" + batchNum + ":"
 					+ (System.currentTimeMillis() - batchStartTime) + "ms");
@@ -148,62 +178,67 @@ public class DomainValidator {
 	}
 
 	private void performRequest(final Map<String, String[]> urlMap,
-			final boolean addToUnknownHostsList) {
+			final boolean addFailedURLToList) {
 		final CountDownLatch latch = new CountDownLatch(urlMap.size());
 		for (final String url : urlMap.keySet()) {
 			try {
-				httpclient.execute(new HttpGet(url),
-						new FutureCallback<HttpResponse>() {
+				client.prepareGet(url).execute(new AsyncHandler<Void>() {
+					private final Response.ResponseBuilder builder = new Response.ResponseBuilder();
 
-							public void failed(Exception e) {
-								latch.countDown();
-								logger.error(url
-										+ " failed from being processed", e);
-								if (e instanceof UnknownHostException) {
-									if (addToUnknownHostsList) {
-										unknownHostsURLList.add(urlMap.get(url));
-									}
-									return;
-								}
-								if (includeFailedDomains) {
-									csvWriter.writeNext(urlMap.get(url));
-								}
-							}
+					@Override
+					public void onThrowable(Throwable e) {
+						latch.countDown();
+						failedURLs.incrementAndGet();
+						logger.error(url + " failed from being processed", e);
+						if (addFailedURLToList) {
+							failedURLList.add(urlMap.get(url));
+						}
+						if (includeFailedDomains) {
+							csvWriter.writeNext(urlMap.get(url));
+						}
 
-							public void completed(HttpResponse response) {
-								latch.countDown();
-								try {
-									InputStream stream = response.getEntity()
-											.getContent();
-									String responseString = new Scanner(stream)
-											.useDelimiter("\\A").next();
-									if (!isDomainForSale(responseString)) {
-										csvWriter.writeNext(urlMap.get(url));
-										return;
-									}
-								} catch (IllegalStateException e) {
-									logger.error(
-											url
-													+ " failed from being processed but included in CSV",
-											e);
+					}
 
-								} catch (IOException e) {
-									logger.error(
-											url
-													+ " failed from being processed but included in CSV",
-											e);
+					@Override
+					public com.ning.http.client.AsyncHandler.STATE onBodyPartReceived(
+							HttpResponseBodyPart content) throws Exception {
+						builder.accumulate(content);
+						return STATE.CONTINUE;
+					}
 
-								}
-								if (includeFailedDomains) {
-									csvWriter.writeNext(urlMap.get(url));
-								}
-							}
+					@Override
+					public com.ning.http.client.AsyncHandler.STATE onStatusReceived(
+							HttpResponseStatus status) throws Exception {
+						builder.accumulate(status);
+						return STATE.CONTINUE;
+					}
 
-							public void cancelled() {
-								latch.countDown();
-								csvWriter.writeNext(urlMap.get(url));
-							}
-						});
+					@Override
+					public com.ning.http.client.AsyncHandler.STATE onHeadersReceived(
+							HttpResponseHeaders headers) throws Exception {
+						builder.accumulate(headers);
+						return STATE.CONTINUE;
+					}
+
+					@Override
+					public Void onCompleted() throws Exception {
+						latch.countDown();
+						String responseString = builder.build()
+								.getResponseBody();
+						if (!isDomainForSale(responseString)) {
+							csvWriter.writeNext(urlMap.get(url));
+							return null;
+						} else {
+							invalidDomainURLs.incrementAndGet();
+						}
+
+						if (includeFailedDomains) {
+							csvWriter.writeNext(urlMap.get(url));
+						}
+						return null;
+					}
+				});
+
 			} catch (Exception e) {
 				latch.countDown();
 				logger.error("Exception while executing request for " + url, e);
